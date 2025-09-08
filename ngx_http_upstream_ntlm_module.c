@@ -141,11 +141,6 @@ static ngx_int_t ngx_http_upstream_init_ntlm(ngx_conf_t *cf,
         cached[i].queued_in_cache = 0;
     }
 
-    /* (опционально) клампинг таймаута, чтобы не было экстрима
-    if (hncf->timeout < 1000) hncf->timeout = 1000;
-    if (hncf->timeout > 24*60*60*1000) hncf->timeout = 24*60*60*1000;
-    */
-
     return NGX_OK;
 }
 
@@ -261,12 +256,12 @@ found:
         ngx_http_upstream_ntlm_close(c);
         pc->cached = 0;
         pc->connection = NULL;
-        item->peer_connection = NULL; /* не держим висячий указатель */
+        item->peer_connection = NULL; /* no dangling pointer */
 
         return NGX_OK;
     }
 
-    /* non-blocking peek only if ready: n==0 => FIN, n==-1 && !EAGAIN => error */
+    /* A4: peek only when readable — forbid reuse if backend already pushed data */
     if (c->read->ready) {
         int  n;
         char b;
@@ -351,6 +346,25 @@ static void ngx_http_upstream_free_ntlm_peer(ngx_peer_connection_t *pc,
         goto invalid;
     }
 
+    /* A4: don't cache if socket not fully "quiet" */
+    if (c->buffered) {                 /* nginx still has buffered output */
+        goto invalid;
+    }
+    if (c->read->ready) {
+        int  n;
+        char b;
+        n = recv(c->fd, &b, 1, MSG_PEEK);
+        if (n > 0) {                   /* backend already pushed more bytes */
+            goto invalid;
+        }
+        if (n == 0) {                  /* FIN */
+            goto invalid;
+        }
+        if (n == -1 && ngx_socket_errno != NGX_EAGAIN) {
+            goto invalid;
+        }
+    }
+
     if (ngx_queue_empty(&hndp->conf->free)) {
         q = ngx_queue_last(&hndp->conf->cache);
         ngx_queue_remove(q);
@@ -400,7 +414,7 @@ static void ngx_http_upstream_free_ntlm_peer(ngx_peer_connection_t *pc,
 
     pc->connection = NULL;
 
-    /* привести сокет в idle-состояние и повесить таймер */
+    /* bring socket to idle and arm read timeout for eviction */
     c->read->delayed = 0;
 
     if (c->write->timer_set) ngx_del_timer(c->write);
