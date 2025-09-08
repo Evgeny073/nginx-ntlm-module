@@ -1,7 +1,6 @@
 #include <ngx_config.h>
 #include <ngx_core.h>
 #include <ngx_http.h>
-#include "src/ntlm_abort.h"   /* или "ntlm_abort.h", если файл рядом */
 
 
 static ngx_int_t
@@ -188,8 +187,6 @@ ngx_http_upstream_init_ntlm_peer(ngx_http_request_t *r,
     hnpd->request = r;   /* <— сохраняем r, т.к. u->request может отсутствовать */
     hnpd->data = r->upstream->peer.data;
     hnpd->client_connection = r->connection;
-    /* A1: register client-abort cleanup early (upstream may not be ready yet) */
-    (void) ngx_http_ntlm_abort_register(r, NULL);
 
     hnpd->original_get_peer = r->upstream->peer.get;
     hnpd->original_free_peer = r->upstream->peer.free;
