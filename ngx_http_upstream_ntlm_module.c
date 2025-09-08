@@ -228,7 +228,6 @@ ngx_http_ntlm_should_lenient_auto(ngx_http_request_t *r)
                                 (char *)"action=", sizeof("action=")-1))
             {
                 u_char *p = r->headers_in.content_type->value.data;
-                size_t   n = r->headers_in.content_type->value.len;
                 /* простая проверка на наличие известных слов */
                 if (ngx_strcasestrn(p, (char *)"GetStreamingEvents", sizeof("GetStreamingEvents")-1) ||
                     ngx_strcasestrn(p, (char *)"Subscribe",            sizeof("Subscribe")-1) ||
