@@ -245,25 +245,66 @@ static ngx_int_t ngx_http_upstream_get_ntlm_peer(ngx_peer_connection_t *pc,
 
 found:
 
-    ngx_log_debug1(NGX_LOG_DEBUG_HTTP, pc->log, 0,
-                   "ntlm peer using connection %p", c);
+    /* sanity/liveness check before reusing cached connection */
+    if (c->fd == (ngx_socket_t) -1
+        || c->close
+        || c->read->eof || c->read->error || c->read->timedout
+        || c->write->error || c->write->timedout)
+    {
+        /* cached socket is not reusable -> discard it and fall back to fresh connect */
+        ngx_log_debug1(NGX_LOG_DEBUG_HTTP, pc->log, 0,
+                       "ntlm peer cached connection %p is dead, closing", c);
 
+        ngx_http_upstream_ntlm_close(c);
+        pc->cached = 0;
+        pc->connection = NULL;
+
+        /* ничего не возвращаем из кеша; позволяем nginx открыть новый сокет */
+        return NGX_OK;
+    }
+
+    /* non-blocking liveness probe: peek 1 byte;
+       n == 0 => FIN from backend; n == -1 && EAGAIN => no data but alive */
+    {
+        int  n;
+        char b;
+        n = recv(c->fd, &b, 1, MSG_PEEK);
+        if (n == 0 || (n == -1 && ngx_socket_errno != NGX_EAGAIN)) {
+            ngx_log_debug2(NGX_LOG_DEBUG_HTTP, pc->log, 0,
+                           "ntlm peer cached connection %p failed peek (n=%d), closing", c, n);
+            ngx_http_upstream_ntlm_close(c);
+            pc->cached = 0;
+            pc->connection = NULL;
+            return NGX_OK;
+        }
+    }
+
+    ngx_log_debug1(NGX_LOG_DEBUG_HTTP, pc->log, 0,
+                   "ntlm peer using cached connection %p", c);
+
+    /* prepare socket for reuse */
     c->idle = 0;
     c->sent = 0;
     c->data = NULL;
-    c->log = pc->log;
-    c->read->log = pc->log;
-    c->write->log = pc->log;
-    c->pool->log = pc->log;
 
-    if (c->read->timer_set) {
-        ngx_del_timer(c->read);
-    }
+    /* сбросим таймеры/handlers, их выставит апстрим */
+    if (c->read->timer_set)  ngx_del_timer(c->read);
+    if (c->write->timer_set) ngx_del_timer(c->write);
+    c->read->delayed = 0;
+
+    c->read->handler  = NULL;
+    c->write->handler = NULL;
+
+    c->log        = pc->log;
+    c->read->log  = pc->log;
+    c->write->log = pc->log;
+    c->pool->log  = pc->log;
 
     pc->connection = c;
-    pc->cached = 1;
+    pc->cached     = 1;
 
     return NGX_DONE;
+
 }
 
 static void ngx_http_upstream_free_ntlm_peer(ngx_peer_connection_t *pc,
@@ -329,6 +370,28 @@ static void ngx_http_upstream_free_ntlm_peer(ngx_peer_connection_t *pc,
     item->peer_connection = c;
     item->client_connection = hndp->client_connection;
     item->client_closed = 0;     /* A3 */
+
+    c->read->handler  = ngx_http_upstream_ntlm_close_handler;
+    c->write->handler = ngx_http_upstream_ntlm_dummy_handler;
+
+    c->read->delayed = 0;
+
+    if (c->write->timer_set) {
+        ngx_del_timer(c->write);
+    }
+    if (c->read->timer_set) {
+        ngx_del_timer(c->read);
+    }
+    ngx_add_timer(c->read, hndp->conf->timeout);
+
+    c->idle = 1;
+    c->data = item;
+
+    /* логи остаются цикловые (как у тебя) */
+    c->log        = ngx_cycle->log;
+    c->read->log  = ngx_cycle->log;
+    c->write->log = ngx_cycle->log;
+    c->pool->log  = ngx_cycle->log;
 
     ngx_log_debug2(
         NGX_LOG_DEBUG_HTTP, pc->log, 0,
