@@ -1,6 +1,8 @@
 #include <ngx_config.h>
 #include <ngx_core.h>
 #include <ngx_http.h>
+#include "src/ntlm_abort.h"   /* или "ntlm_abort.h", если файл рядом */
+
 
 static ngx_int_t
 ngx_http_upstream_init_ntlm_peer(ngx_http_request_t *r,
@@ -41,6 +43,8 @@ typedef struct {
     ngx_queue_t queue;
     ngx_connection_t *peer_connection;
     ngx_connection_t *client_connection;
+    unsigned client_closed:1;   /* A3: client aborted */
+    unsigned queued_in_cache:1; /* A3: in cache queue now */
 } ngx_http_upstream_ntlm_cache_t;
 
 typedef struct {
@@ -133,6 +137,8 @@ static ngx_int_t ngx_http_upstream_init_ntlm(ngx_conf_t *cf,
     for (i = 0; i < hncf->max_cached; i++) {
         ngx_queue_insert_head(&hncf->free, &cached[i].queue);
         cached[i].conf = hncf;
+        cached[i].client_closed   = 0;
+        cached[i].queued_in_cache = 0;
     }
 
     return NGX_OK;
@@ -180,6 +186,8 @@ ngx_http_upstream_init_ntlm_peer(ngx_http_request_t *r,
     hnpd->upstream = r->upstream;
     hnpd->data = r->upstream->peer.data;
     hnpd->client_connection = r->connection;
+    /* A1: register client-abort cleanup early (upstream may not be ready yet) */
+    (void) ngx_http_ntlm_abort_register(r, NULL);
 
     hnpd->original_get_peer = r->upstream->peer.get;
     hnpd->original_free_peer = r->upstream->peer.free;
@@ -227,6 +235,7 @@ static ngx_int_t ngx_http_upstream_get_ntlm_peer(ngx_peer_connection_t *pc,
         if (item->client_connection == hndp->client_connection) {
             c = item->peer_connection;
             ngx_queue_remove(q);
+            item->queued_in_cache = 0; /* A3 */
             ngx_queue_insert_head(&hndp->conf->free, q);
             hndp->cached = 1;
             goto found;
@@ -254,6 +263,8 @@ found:
 
     pc->connection = c;
     pc->cached = 1;
+    /* A1: now upstream peer is known → update cleanup to point to it */
+    (void) ngx_http_ntlm_abort_update(hndp->upstream->request, pc->connection);
 
     return NGX_DONE;
 }
@@ -307,6 +318,8 @@ static void ngx_http_upstream_free_ntlm_peer(ngx_peer_connection_t *pc,
         item = ngx_queue_data(q, ngx_http_upstream_ntlm_cache_t, queue);
         ngx_http_upstream_ntlm_close(item->peer_connection);
         item->peer_connection = NULL;
+        item->client_closed   = 0;
+        item->queued_in_cache = 0;
     } else {
         q = ngx_queue_head(&hndp->conf->free);
         ngx_queue_remove(q);
@@ -314,9 +327,11 @@ static void ngx_http_upstream_free_ntlm_peer(ngx_peer_connection_t *pc,
     }
 
     ngx_queue_insert_head(&hndp->conf->cache, q);
+    item->queued_in_cache = 1;   /* A3 */
 
     item->peer_connection = c;
     item->client_connection = hndp->client_connection;
+    item->client_closed = 0;     /* A3 */
 
     ngx_log_debug2(
         NGX_LOG_DEBUG_HTTP, pc->log, 0,
@@ -371,19 +386,14 @@ invalid:
 static void ngx_http_upstream_client_conn_cleanup(void *data) {
     ngx_http_upstream_ntlm_cache_t *item = data;
     
-    ngx_log_debug2(
-        NGX_LOG_DEBUG_HTTP, ngx_cycle->log, 0,
-        "ntlm client connection closed %p, droping peer connection %p",
-        item->client_connection, item->peer_connection);
+    ngx_log_debug2(NGX_LOG_DEBUG_HTTP, ngx_cycle->log, 0,
+                "ntlm client closed %p, posting close for upstream %p",
+                item->client_connection, item->peer_connection);
 
-    // Check if the item was removed previously from the queue (backend drop)
     if (item->peer_connection != NULL) {
-
-        item->peer_connection->read->timedout = 1;
-        ngx_post_event(item->peer_connection->read,&ngx_posted_events);
-
-        ngx_queue_remove(&item->queue);
-        ngx_queue_insert_head(&item->conf->free, &item->queue);
+        item->client_closed = 1;                     /* A1/A3 mark */
+        item->peer_connection->read->timedout = 1;   /* force close-handler path */
+        ngx_post_event(item->peer_connection->read, &ngx_posted_events);
     }
 }
 
@@ -391,48 +401,63 @@ static void ngx_http_upstream_ntlm_dummy_handler(ngx_event_t *ev) {
     ngx_log_debug0(NGX_LOG_DEBUG_HTTP, ev->log, 0, "ntlm dummy handler");
 }
 
-static void ngx_http_upstream_ntlm_close_handler(ngx_event_t *ev) {
-    ngx_http_upstream_ntlm_srv_conf_t *conf;
-    ngx_http_upstream_ntlm_cache_t *item;
-
-    int n;
-    char buf[1];
-    ngx_connection_t *c;
+static void
+ngx_http_upstream_ntlm_close_handler(ngx_event_t *ev)
+{
+    ngx_http_upstream_ntlm_srv_conf_t  *conf;
+    ngx_http_upstream_ntlm_cache_t     *item;
+    ngx_connection_t                   *c;
+    int                                  n;
+    char                                 buf[1];
 
     c = ev->data;
 
-    if (c->close || c->read->timedout) {
-        goto close;
+    /* Идемпотентный гард: если сокет уже закрыт — выходим */
+    if (c->fd == (ngx_socket_t) -1 || c->close) {
+        return;
     }
 
-    n = recv(c->fd, buf, 1, MSG_PEEK);
+    /* Если события таймаута нет, проверим, реально ли есть что читать */
+    if (!c->read->timedout) {
+        n = recv(c->fd, buf, 1, MSG_PEEK);
 
-    if (n == -1 && ngx_socket_errno == NGX_EAGAIN) {
-        ev->ready = 0;
+        if (n == -1 && ngx_socket_errno == NGX_EAGAIN) {
+            ev->ready = 0;
 
-        if (ngx_handle_read_event(c->read, 0) != NGX_OK) {
-            goto close;
+            if (ngx_handle_read_event(c->read, 0) != NGX_OK) {
+                /* не смогли перевесить read-ивент — закрываем */
+                goto close;
+            }
+
+            /* ничего читать, возвращаемся; закроем позже по событию */
+            return;
         }
-
-        return;
     }
 
 close:
 
     ngx_log_debug2(NGX_LOG_DEBUG_HTTP, ev->log, 0,
-                   "ntlm close peer connection %p, timeout %ui", c,
-                   c->read->timedout);
+                   "ntlm close peer connection %p, timeout %ui",
+                   c, c->read->timedout);
 
     item = c->data;
     conf = item->conf;
-   
-    // set the item peer connection to null to make sure we don't close it again
-    // when the client connection cleanup is triggered
+
+    /* Сначала обнулим ссылку, чтобы cleanup не постил событие повторно */
     item->peer_connection = NULL;
+
+    /* ВАЖНО: трогаем очереди только здесь и только если элемент реально в cache */
+    if (item->queued_in_cache) {
+        ngx_queue_remove(&item->queue);
+        item->queued_in_cache = 0;
+        ngx_queue_insert_head(&conf->free, &item->queue);
+    }
+
+    /* Жёстко закрываем апстрим-коннект */
     ngx_http_upstream_ntlm_close(c);
 
-    ngx_queue_remove(&item->queue);
-    ngx_queue_insert_head(&conf->free, &item->queue);
+    /* Сбрасываем флаги состояния */
+    item->client_closed = 0;
 }
 
 static void ngx_http_upstream_ntlm_close(ngx_connection_t *c) {

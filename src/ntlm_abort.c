@@ -6,6 +6,7 @@ static ngx_http_ntlm_abort_ctx_t *
 ngx_http_ntlm_abort_get_or_create_ctx(ngx_http_request_t *r)
 {
     ngx_http_cleanup_t *cln;
+
     for (cln = r->cleanup; cln; cln = cln->next) {
         if (cln->handler == ngx_http_ntlm_abort_handler && cln->data) {
             return (ngx_http_ntlm_abort_ctx_t *)cln->data;
@@ -19,6 +20,7 @@ ngx_http_ntlm_abort_get_or_create_ctx(ngx_http_request_t *r)
     ngx_memzero(ctx, sizeof(*ctx));
     ctx->r = r;
     ctx->log = r->connection ? r->connection->log : ngx_cycle->log;
+
     cln->handler = ngx_http_ntlm_abort_handler;
     return ctx;
 }
@@ -47,7 +49,7 @@ ngx_int_t
 ngx_http_ntlm_abort_register(ngx_http_request_t *r, ngx_connection_t *uconn)
 {
     ngx_http_ntlm_abort_ctx_t *ctx = ngx_http_ntlm_abort_get_or_create_ctx(r);
-    if (ctx == NULL) return NGX_ERROR;
+    if (!ctx) return NGX_ERROR;
     ctx->upstream_conn = uconn;
     return NGX_OK;
 }
@@ -56,7 +58,7 @@ ngx_int_t
 ngx_http_ntlm_abort_update(ngx_http_request_t *r, ngx_connection_t *uconn)
 {
     ngx_http_ntlm_abort_ctx_t *ctx = ngx_http_ntlm_abort_get_or_create_ctx(r);
-    if (ctx == NULL) return NGX_ERROR;
+    if (!ctx) return NGX_ERROR;
     ctx->upstream_conn = uconn;
     return NGX_OK;
 }
