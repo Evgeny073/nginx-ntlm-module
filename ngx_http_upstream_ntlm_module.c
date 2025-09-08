@@ -262,8 +262,6 @@ found:
 
     pc->connection = c;
     pc->cached = 1;
-    /* A1: now upstream peer is known → update cleanup to point to it */
-    (void) ngx_http_ntlm_abort_update(hndp->request, pc->connection);
 
     return NGX_DONE;
 }
