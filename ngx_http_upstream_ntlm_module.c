@@ -54,6 +54,7 @@ typedef struct {
     ngx_connection_t *client_connection;
     unsigned cached : 1;
     unsigned ntlm_init : 1;
+    ngx_http_request_t *request;              /* <— добавили */
     ngx_event_get_peer_pt original_get_peer;
     ngx_event_free_peer_pt original_free_peer;
 #if (NGX_HTTP_SSL)
@@ -184,6 +185,7 @@ ngx_http_upstream_init_ntlm_peer(ngx_http_request_t *r,
 
     hnpd->conf = hncf;
     hnpd->upstream = r->upstream;
+    hnpd->request = r;   /* <— сохраняем r, т.к. u->request может отсутствовать */
     hnpd->data = r->upstream->peer.data;
     hnpd->client_connection = r->connection;
     /* A1: register client-abort cleanup early (upstream may not be ready yet) */
@@ -264,7 +266,7 @@ found:
     pc->connection = c;
     pc->cached = 1;
     /* A1: now upstream peer is known → update cleanup to point to it */
-    (void) ngx_http_ntlm_abort_update(hndp->upstream->request, pc->connection);
+    (void) ngx_http_ntlm_abort_update(hndp->request, pc->connection);
 
     return NGX_DONE;
 }
